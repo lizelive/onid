@@ -6,14 +6,14 @@ This repository implements a reconstruction experiment for the pipeline:
 
 The target stack follows the requested gated Hugging Face assets:
 
-- `facebook/dinov3-vit7b16-pretrain-lvd1689m`
+- `facebook/dinov3-convnext-large-pretrain-lvd1689m`
 - `black-forest-labs/FLUX.2-klein-9B` (VAE component only)
 - `ILSVRC/imagenet-1k`
 
 ## Important constraints
 
 - All three assets are gated. The current Hugging Face account must have accepted access terms.
-- `dense` DINO patch-token caching at ImageNet-1k scale is multi-terabyte. The scalable path is `pooled` embeddings or online DINO extraction.
+- `dense` DINO embedding caching at ImageNet-1k scale is multi-terabyte. The scalable dense path is fully online supervision: compute DINO embeddings and FLUX latents on demand during training.
 - The included smoke experiment is designed to run end to end on one RTX 4090 with CPU offload available.
 
 ## Setup
@@ -81,15 +81,51 @@ Run the full smoke workflow:
 python -m onid.smoke --output-root outputs/smoke_e2e
 ```
 
+Train dense decoders directly from ImageNet with online DINO embeddings, online FLUX latent targets, automatic batch sizing, and resumable checkpoints:
+
+```bash
+python -m onid.train \
+  --train-split train \
+  --val-split validation \
+  --resolution 256 \
+  --output-dir outputs/full_dense_online/dense-residual \
+  --embedding-kind dense \
+  --decoder-architecture dense-residual \
+  --epochs 3 \
+  --auto-batch-size \
+  --max-batch-size 256 \
+  --eval-batch-size 8 \
+  --checkpoint-interval-steps 500 \
+  --online-shuffle-buffer 128 \
+  --resume
+```
+
+Launch the full latent-cache plus dense architecture sweep in a detached process:
+
+```bash
+nohup bash scripts/run_full_dense_experiments.sh > outputs/full_dense_online/pipeline.log 2>&1 < /dev/null &
+```
+
 ## Experiment variants
 
 - `pooled`: regress FLUX VAE latents from DINO pooled output. This is the scalable baseline for ImageNet-1k.
-- `dense`: regress FLUX VAE latents from DINO patch tokens reshaped as a spatial tensor. This preserves dense information but is too large to cache across full ImageNet-1k without aggressive compression or online extraction.
+- `dense`: regress FLUX VAE latents from DINO patch tokens reshaped as a spatial tensor. Full-scale training should stream ImageNet directly and compute both DINO embeddings and FLUX latents online.
+
+Dense decoder architecture options:
+
+- `dense-residual`: constant-width residual upsampling baseline.
+- `dense-pyramid`: wider early stages with a tapered channel schedule.
+- `dense-bottleneck`: higher-width bottleneck residual blocks for a stronger capacity baseline.
 
 ## Expected storage
 
 At `256x256` resolution:
 
-- FLUX VAE latents are small enough for full-dataset caching.
+- FLUX VAE latents are cheap enough to compute online on a 4090, which avoids writing dataset-scale artifacts.
 - DINO pooled embeddings are modest and fit comfortably on disk.
 - DINO dense patch-token tensors dominate storage and are not practical to cache for the full dataset on a 2 TB workspace.
+
+## Recovery
+
+- `onid.train --resume` writes `last.pt` and `state.json` during training, so interrupted long runs continue from the latest checkpointed step without rebuilding any dataset cache.
+

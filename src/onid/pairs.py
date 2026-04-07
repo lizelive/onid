@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
-import math
 import random
 from pathlib import Path
 from typing import Any
@@ -17,7 +16,15 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms.functional import center_crop, normalize, resize, to_tensor
 from tqdm import tqdm
 
-from onid.hf_models import DINO_MODEL_NAME, FLUX_MODEL_NAME, load_dino_encoder, load_flux_vae, module_device, preferred_dtype
+from onid.hf_models import (
+    DINO_MODEL_NAME,
+    FLUX_MODEL_NAME,
+    extract_embedding,
+    load_dino_encoder,
+    load_flux_vae,
+    module_device,
+    preferred_dtype,
+)
 
 
 IMAGENET_DATASET_NAME = "ILSVRC/imagenet-1k"
@@ -29,17 +36,6 @@ def preprocess_image(image: Image.Image, resolution: int) -> torch.Tensor:
     image = resize(image, resolution, interpolation=InterpolationMode.BICUBIC, antialias=True)
     image = center_crop(image, [resolution, resolution])
     return to_tensor(image)
-
-
-@torch.inference_mode()
-def extract_dense_embedding(outputs: Any, num_register_tokens: int) -> torch.Tensor:
-    token_offset = 1 + num_register_tokens
-    patch_tokens = outputs.last_hidden_state[:, token_offset:, :]
-    grid_size = int(math.sqrt(patch_tokens.shape[1]))
-    if grid_size * grid_size != patch_tokens.shape[1]:
-        raise ValueError(f"Patch token count {patch_tokens.shape[1]} is not a square number")
-    patch_tokens = patch_tokens.reshape(patch_tokens.shape[0], grid_size, grid_size, patch_tokens.shape[-1])
-    return patch_tokens.permute(0, 3, 1, 2).contiguous()
 
 
 @torch.inference_mode()
@@ -61,13 +57,7 @@ def encode_sample(
     ).unsqueeze(0)
     dino_tensor = dino_tensor.to(module_device(dino_model), dtype=dtype)
     dino_outputs = dino_model(pixel_values=dino_tensor)
-
-    if embedding_kind == "pooled":
-        embedding = dino_outputs.pooler_output
-    elif embedding_kind == "dense":
-        embedding = extract_dense_embedding(dino_outputs, dino_model.config.num_register_tokens)
-    else:
-        raise ValueError(f"Unsupported embedding_kind: {embedding_kind}")
+    embedding = extract_embedding(dino_outputs, dino_model, embedding_kind)
 
     vae_pixels = ((image_tensor * 2.0) - 1.0).unsqueeze(0)
     vae_pixels = vae_pixels.to(module_device(vae), dtype=dtype)
@@ -96,13 +86,7 @@ def encode_batch(
     dino_tensor = (pixel_batch - mean) / std
     dino_tensor = dino_tensor.to(module_device(dino_model), dtype=dtype)
     dino_outputs = dino_model(pixel_values=dino_tensor)
-
-    if embedding_kind == "pooled":
-        embeddings = dino_outputs.pooler_output
-    elif embedding_kind == "dense":
-        embeddings = extract_dense_embedding(dino_outputs, dino_model.config.num_register_tokens)
-    else:
-        raise ValueError(f"Unsupported embedding_kind: {embedding_kind}")
+    embeddings = extract_embedding(dino_outputs, dino_model, embedding_kind)
 
     vae_pixels = ((pixel_batch * 2.0) - 1.0).to(module_device(vae), dtype=dtype)
     latent_dist = vae.encode(vae_pixels).latent_dist
@@ -112,28 +96,51 @@ def encode_batch(
     return embeddings.cpu().to(torch.bfloat16), latents.cpu().to(torch.bfloat16)
 
 
+@torch.inference_mode()
+def encode_latents_batch(
+    images: list[Image.Image],
+    resolution: int,
+    vae: torch.nn.Module,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    image_tensors = [preprocess_image(image, resolution) for image in images]
+    pixel_batch = torch.stack(image_tensors, dim=0)
+    vae_pixels = ((pixel_batch * 2.0) - 1.0).to(module_device(vae), dtype=dtype)
+    latent_dist = vae.encode(vae_pixels).latent_dist
+    scaling_factor = getattr(vae.config, "scaling_factor", 1.0)
+    latents = latent_dist.mean * scaling_factor
+    return latents.cpu().to(torch.bfloat16)
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(content)
+    temp_path.replace(path)
+
+
 def save_shard(
     output_dir: Path,
     shard_index: int,
-    embeddings: list[torch.Tensor],
-    latents: list[torch.Tensor],
+    tensors: dict[str, list[torch.Tensor]],
 ) -> dict[str, Any]:
     shard_name = f"shard-{shard_index:05d}.pt"
     shard_path = output_dir / shard_name
-    torch.save(
-        {
-            "embedding": torch.stack(embeddings, dim=0),
-            "latents": torch.stack(latents, dim=0),
-        },
-        shard_path,
-    )
+    shard_data = {name: torch.stack(values, dim=0) for name, values in tensors.items()}
+    torch.save(shard_data, shard_path)
+    first_key = next(iter(tensors))
     return {
         "file": shard_name,
-        "count": len(embeddings),
+        "count": len(tensors[first_key]),
     }
 
 
-def iter_imagenet_samples(split: str, max_samples: int, shuffle: bool, seed: int) -> Any:
+def iter_imagenet_samples(
+    split: str,
+    max_samples: int,
+    shuffle: bool,
+    seed: int,
+    start_index: int = 0,
+) -> Any:
     remote_files = [
         file_name
         for file_name in list_repo_files(IMAGENET_DATASET_NAME, repo_type="dataset")
@@ -143,8 +150,12 @@ def iter_imagenet_samples(split: str, max_samples: int, shuffle: bool, seed: int
     if shuffle:
         random.Random(seed).shuffle(remote_files)
 
-    yielded = 0
     sample_limit = None if max_samples <= 0 else max_samples
+    if sample_limit is not None and start_index >= sample_limit:
+        return
+
+    emitted = 0
+    remaining_skip = start_index
 
     for remote_file in remote_files:
         local_file = hf_hub_download(
@@ -155,11 +166,33 @@ def iter_imagenet_samples(split: str, max_samples: int, shuffle: bool, seed: int
         shard_dataset = load_dataset("parquet", data_files={"data": local_file}, split="data")
         if shuffle:
             shard_dataset = shard_dataset.shuffle(seed=seed)
-        for sample in shard_dataset:
+        if remaining_skip >= len(shard_dataset):
+            remaining_skip -= len(shard_dataset)
+            continue
+
+        start_row = remaining_skip
+        remaining_skip = 0
+        for row_index in range(start_row, len(shard_dataset)):
+            sample = shard_dataset[row_index]
             yield sample
-            yielded += 1
-            if sample_limit is not None and yielded >= sample_limit:
+            emitted += 1
+            total_seen = start_index + emitted
+            if sample_limit is not None and total_seen >= sample_limit:
                 return
+
+
+def load_manifest(root_dir: str | Path) -> dict[str, Any]:
+    return json.loads((Path(root_dir) / "manifest.json").read_text())
+
+
+def iter_sharded_tensors(root_dir: str | Path, key: str) -> Any:
+    manifest = load_manifest(root_dir)
+    root_path = Path(root_dir)
+    for shard in manifest["shards"]:
+        shard_file = root_path / shard["file"]
+        shard_data = torch.load(shard_file, map_location="cpu")
+        for tensor in shard_data[key]:
+            yield tensor.float()
 
 
 def precompute_pairs(
@@ -173,19 +206,50 @@ def precompute_pairs(
     seed: int = 0,
     streaming: bool = True,
     shuffle: bool = False,
+    cache_mode: str = "pairs",
+    resume: bool = False,
 ) -> Path:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     dtype = preferred_dtype()
-    processor, dino_model = load_dino_encoder(dtype=dtype)
+    processor = None
+    dino_model = None
+    if cache_mode == "pairs":
+        processor, dino_model = load_dino_encoder(dtype=dtype)
     vae = load_flux_vae(dtype=dtype)
 
     embeddings: list[torch.Tensor] = []
     latents: list[torch.Tensor] = []
-    shards: list[dict[str, Any]] = []
-    embedding_shape: list[int] | None = None
-    latent_shape: list[int] | None = None
+    manifest_path = output_path / "manifest.json"
+    if resume and manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        shards = manifest["shards"]
+        embedding_shape = manifest.get("embedding_shape")
+        latent_shape = manifest.get("latent_shape")
+    else:
+        manifest = {
+            "dataset": IMAGENET_DATASET_NAME,
+            "split": split,
+            "resolution": resolution,
+            "cache_mode": cache_mode,
+            "embedding_kind": embedding_kind if cache_mode == "pairs" else None,
+            "embedding_shape": None,
+            "latent_shape": None,
+            "num_samples": 0,
+            "dino_model": DINO_MODEL_NAME if cache_mode == "pairs" else None,
+            "flux_model": FLUX_MODEL_NAME,
+            "shards": [],
+        }
+        shards = manifest["shards"]
+        embedding_shape = None
+        latent_shape = None
+
+    completed_samples = sum(shard["count"] for shard in shards)
+    remaining_samples = max_samples if max_samples > 0 else None
+    if remaining_samples is not None and completed_samples >= remaining_samples:
+        return manifest_path
+
     image_batch: list[Image.Image] = []
 
     def flush_batch() -> None:
@@ -193,36 +257,69 @@ def precompute_pairs(
         if not image_batch:
             return
 
-        batch_embeddings, batch_latents = encode_batch(
-            images=image_batch,
-            resolution=resolution,
-            processor=processor,
-            dino_model=dino_model,
-            vae=vae,
-            embedding_kind=embedding_kind,
-            dtype=dtype,
-        )
-        for embedding, latent in zip(batch_embeddings, batch_latents):
-            embeddings.append(embedding)
+        batch_embeddings = None
+        if cache_mode == "pairs":
+            batch_embeddings, batch_latents = encode_batch(
+                images=image_batch,
+                resolution=resolution,
+                processor=processor,
+                dino_model=dino_model,
+                vae=vae,
+                embedding_kind=embedding_kind,
+                dtype=dtype,
+            )
+        else:
+            batch_latents = encode_latents_batch(
+                images=image_batch,
+                resolution=resolution,
+                vae=vae,
+                dtype=dtype,
+            )
+
+        for sample_index, latent in enumerate(batch_latents):
+            if batch_embeddings is not None:
+                embedding = batch_embeddings[sample_index]
+                embeddings.append(embedding)
             latents.append(latent)
 
-            if embedding_shape is None:
-                embedding_shape = list(embedding.shape)
+            if embedding_shape is None and batch_embeddings is not None:
+                embedding_shape = list(batch_embeddings[sample_index].shape)
+                latent_shape = list(latent.shape)
+            elif latent_shape is None:
                 latent_shape = list(latent.shape)
 
-            if len(embeddings) == shard_size:
-                shards.append(save_shard(output_path, len(shards), embeddings, latents))
-                embeddings.clear()
+            sample_count = len(latents) if cache_mode == "latents" else len(embeddings)
+            if sample_count == shard_size:
+                tensor_map: dict[str, list[torch.Tensor]] = {"latents": latents}
+                if cache_mode == "pairs":
+                    tensor_map["embedding"] = embeddings
+                shards.append(save_shard(output_path, len(shards), tensor_map))
+                if cache_mode == "pairs":
+                    embeddings.clear()
                 latents.clear()
+                manifest["embedding_shape"] = embedding_shape
+                manifest["latent_shape"] = latent_shape
+                manifest["num_samples"] = sum(shard["count"] for shard in shards)
+                atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
             progress.update(1)
         image_batch.clear()
 
-    progress_total = max_samples if max_samples > 0 else None
-    progress = tqdm(total=progress_total, desc=f"precompute:{split}:{embedding_kind}")
-    for sample in iter_imagenet_samples(split=split, max_samples=max_samples, shuffle=shuffle, seed=seed):
+    progress_total = None if max_samples <= 0 else max_samples
+    progress_label = cache_mode if cache_mode == "latents" else embedding_kind
+    progress = tqdm(total=progress_total, desc=f"precompute:{split}:{progress_label}")
+    if completed_samples:
+        progress.update(completed_samples)
+
+    for sample in iter_imagenet_samples(
+        split=split,
+        max_samples=max_samples,
+        shuffle=shuffle,
+        seed=seed,
+        start_index=completed_samples,
+    ):
         image_batch.append(sample["image"])
         if len(image_batch) == encode_batch_size:
             flush_batch()
@@ -230,24 +327,16 @@ def precompute_pairs(
     flush_batch()
 
     if embeddings:
-        shards.append(save_shard(output_path, len(shards), embeddings, latents))
+        shards.append(save_shard(output_path, len(shards), {"embedding": embeddings, "latents": latents}))
+    elif latents:
+        shards.append(save_shard(output_path, len(shards), {"latents": latents}))
 
     progress.close()
 
-    manifest = {
-        "dataset": IMAGENET_DATASET_NAME,
-        "split": split,
-        "resolution": resolution,
-        "embedding_kind": embedding_kind,
-        "embedding_shape": embedding_shape,
-        "latent_shape": latent_shape,
-        "num_samples": sum(shard["count"] for shard in shards),
-        "dino_model": DINO_MODEL_NAME,
-        "flux_model": FLUX_MODEL_NAME,
-        "shards": shards,
-    }
-    manifest_path = output_path / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2))
+    manifest["embedding_shape"] = embedding_shape
+    manifest["latent_shape"] = latent_shape
+    manifest["num_samples"] = sum(shard["count"] for shard in shards)
+    atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
     return manifest_path
 
 
@@ -290,6 +379,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Precompute DINOv3 and FLUX VAE pairs from ImageNet-1k")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--split", default="train", choices=["train", "validation"])
+    parser.add_argument("--cache-mode", default="pairs", choices=["pairs", "latents"])
     parser.add_argument("--embedding-kind", default="pooled", choices=["pooled", "dense"])
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--max-samples", type=int, default=128)
@@ -298,6 +388,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     return parser
 
 
@@ -306,6 +397,7 @@ def main() -> None:
     precompute_pairs(
         output_dir=args.output_dir,
         split=args.split,
+        cache_mode=args.cache_mode,
         embedding_kind=args.embedding_kind,
         resolution=args.resolution,
         max_samples=args.max_samples,
@@ -314,6 +406,7 @@ def main() -> None:
         seed=args.seed,
         streaming=args.streaming,
         shuffle=args.shuffle,
+        resume=args.resume,
     )
 
 

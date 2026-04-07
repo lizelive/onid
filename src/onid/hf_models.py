@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from typing import Tuple
+import math
+from typing import Any, Tuple
 
 import torch
 from diffusers import AutoencoderKLFlux2
 from transformers import AutoImageProcessor, AutoModel
 
 
-DINO_MODEL_NAME = "facebook/dinov3-vit7b16-pretrain-lvd1689m"
+DINO_MODEL_NAME = "facebook/dinov3-convnext-large-pretrain-lvd1689m"
 FLUX_MODEL_NAME = "black-forest-labs/FLUX.2-klein-9B"
 
 
@@ -42,8 +43,35 @@ def load_dino_encoder(
         low_cpu_mem_usage=True,
     )
     model = model.to(device)
+    model.requires_grad_(False)
     model.eval()
     return processor, model
+
+
+def dense_token_offset(model: torch.nn.Module) -> int:
+    return 1 + (getattr(model.config, "num_register_tokens", 0) or 0)
+
+
+def extract_dense_embedding(outputs: Any, model: torch.nn.Module) -> torch.Tensor:
+    token_offset = dense_token_offset(model)
+    patch_tokens = outputs.last_hidden_state[:, token_offset:, :]
+    grid_size = int(math.sqrt(patch_tokens.shape[1]))
+    if grid_size * grid_size != patch_tokens.shape[1]:
+        raise ValueError(f"Patch token count {patch_tokens.shape[1]} is not a square number")
+    patch_tokens = patch_tokens.reshape(patch_tokens.shape[0], grid_size, grid_size, patch_tokens.shape[-1])
+    return patch_tokens.permute(0, 3, 1, 2).contiguous()
+
+
+def extract_embedding(outputs: Any, model: torch.nn.Module, embedding_kind: str) -> torch.Tensor:
+    if embedding_kind == "pooled":
+        pooled = getattr(outputs, "pooler_output", None)
+        if pooled is not None:
+            return pooled
+        patch_tokens = outputs.last_hidden_state[:, dense_token_offset(model) :, :]
+        return patch_tokens.mean(dim=1)
+    if embedding_kind == "dense":
+        return extract_dense_embedding(outputs, model)
+    raise ValueError(f"Unsupported embedding_kind: {embedding_kind}")
 
 
 def load_flux_vae(
@@ -60,6 +88,7 @@ def load_flux_vae(
         torch_dtype=dtype,
     )
     vae = vae.to(device)
+    vae.requires_grad_(False)
     vae.enable_slicing()
     vae.eval()
     return vae
