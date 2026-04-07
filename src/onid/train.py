@@ -6,7 +6,7 @@ import math
 import random
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +25,16 @@ IMAGENET_SPLIT_SIZES = {
     "train": 1_281_167,
     "validation": 50_000,
 }
+
+
+def configure_tf32(device: torch.device, enabled: bool = True) -> bool:
+    if device.type != "cuda":
+        return False
+
+    torch.backends.cuda.matmul.allow_tf32 = enabled
+    torch.backends.cudnn.allow_tf32 = enabled
+    torch.set_float32_matmul_precision("high" if enabled else "highest")
+    return enabled
 
 
 def set_seed(seed: int) -> None:
@@ -52,6 +62,73 @@ def autocast_context(device: torch.device) -> Any:
     return nullcontext()
 
 
+def supports_torch_compile(device: torch.device) -> bool:
+    if not hasattr(torch, "compile"):
+        return False
+    if device.type != "cuda":
+        return False
+    return torch.cuda.get_device_capability(device) >= (7, 0)
+
+
+def maybe_compile(
+    target: Any,
+    device: torch.device,
+    enabled: bool,
+    mode: str,
+    label: str,
+) -> Any:
+    if not enabled or not supports_torch_compile(device):
+        return target
+
+    compiled_target = torch.compile(target, fullgraph=False, mode=mode)
+    compile_failed = False
+
+    def compiled_or_eager(*args: Any, **kwargs: Any) -> Any:
+        nonlocal compile_failed
+        if compile_failed:
+            return target(*args, **kwargs)
+        try:
+            return compiled_target(*args, **kwargs)
+        except Exception as error:
+            compile_failed = True
+            print(f"torch.compile fallback for {label}: {type(error).__name__}: {error}")
+            return target(*args, **kwargs)
+
+    return compiled_or_eager
+
+
+def build_optimizer_step(
+    optimizer: AdamW,
+    device: torch.device,
+    enabled: bool,
+    mode: str,
+) -> Callable[[], None]:
+    if not enabled or not supports_torch_compile(device):
+        return optimizer.step
+
+    def eager_optimizer_step() -> None:
+        optimizer.step()
+
+    return maybe_compile(eager_optimizer_step, device=device, enabled=True, mode=mode, label="optimizer.step")
+
+
+def mark_compile_step_begin(enabled: bool) -> None:
+    if not enabled:
+        return
+    compiler = getattr(torch, "compiler", None)
+    if compiler is None:
+        return
+    marker = getattr(compiler, "cudagraph_mark_step_begin", None)
+    if marker is not None:
+        marker()
+
+
+def set_module_mode(module: nn.Module, compiled_module: Any, training: bool) -> None:
+    module.train(training)
+    if compiled_module is not module and hasattr(compiled_module, "train"):
+        compiled_module.train(training)
+
+
 def resolve_sample_count(split: str, max_samples: int) -> int:
     if split not in IMAGENET_SPLIT_SIZES:
         raise ValueError(f"Unsupported ImageNet split: {split}")
@@ -62,11 +139,16 @@ def resolve_sample_count(split: str, max_samples: int) -> int:
 
 
 @torch.inference_mode()
-def decode_latents(vae: nn.Module, latents: torch.Tensor) -> torch.Tensor:
+def decode_latents(
+    vae: nn.Module,
+    latents: torch.Tensor,
+    vae_decode: Callable[..., Any] | None = None,
+) -> torch.Tensor:
     scaling_factor = getattr(vae.config, "scaling_factor", 1.0)
     vae_param = next(vae.parameters())
     latents = latents.to(device=vae_param.device, dtype=vae_param.dtype)
-    images = vae.decode(latents / scaling_factor).sample
+    decode_fn = vae_decode or vae.decode
+    images = decode_fn(latents / scaling_factor).sample
     return images.add(1.0).div(2.0).clamp(0.0, 1.0)
 
 
@@ -76,30 +158,39 @@ class OnlineEmbeddingEncoder:
         embedding_kind: str,
         resolution: int,
         device: torch.device,
+        enable_compile: bool = False,
+        compile_mode: str = "max-autotune",
     ) -> None:
         self.embedding_kind = embedding_kind
         self.resolution = resolution
         self.device = device
         self.dtype = preferred_dtype()
         self.processor, self.model = load_dino_encoder(device=device, dtype=self.dtype)
+        self.model_forward = maybe_compile(
+            self.model,
+            device=device,
+            enabled=enable_compile,
+            mode=compile_mode,
+            label="dino.encoder",
+        )
         self.image_mean = torch.tensor(self.processor.image_mean, device=device, dtype=torch.float32).view(1, -1, 1, 1)
         self.image_std = torch.tensor(self.processor.image_std, device=device, dtype=torch.float32).view(1, -1, 1, 1)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def infer_embedding_shape(self) -> list[int]:
         dummy = torch.zeros(1, 3, self.resolution, self.resolution, device=self.device, dtype=torch.float32)
         embedding = self.encode(dummy)
         return list(embedding.shape[1:])
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         normalized = images.to(self.device, dtype=torch.float32)
         normalized = (normalized - self.image_mean) / self.image_std
         normalized = normalized.to(dtype=self.dtype)
         with autocast_context(self.device):
-            outputs = self.model(pixel_values=normalized)
+            outputs = self.model_forward(pixel_values=normalized)
             embeddings = extract_embedding(outputs, self.model, self.embedding_kind)
-        return embeddings
+        return embeddings.clone()
 
 
 class OnlineSupervisionEncoder(OnlineEmbeddingEncoder):
@@ -108,26 +199,36 @@ class OnlineSupervisionEncoder(OnlineEmbeddingEncoder):
         embedding_kind: str,
         resolution: int,
         device: torch.device,
+        enable_compile: bool = False,
+        compile_mode: str = "max-autotune",
     ) -> None:
-        super().__init__(embedding_kind=embedding_kind, resolution=resolution, device=device)
+        super().__init__(
+            embedding_kind=embedding_kind,
+            resolution=resolution,
+            device=device,
+            enable_compile=enable_compile,
+            compile_mode=compile_mode,
+        )
         self.vae = load_flux_vae(device=device, dtype=self.dtype)
+        self.vae_encode = self.vae.encode
+        self.vae_decode = self.vae.decode
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def infer_shapes(self) -> tuple[list[int], list[int]]:
         dummy = torch.zeros(1, 3, self.resolution, self.resolution, device=self.device, dtype=torch.float32)
         embeddings, latents = self.encode_supervision(dummy)
         return list(embeddings.shape[1:]), list(latents.shape[1:])
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def encode_supervision(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         images = images.to(self.device, dtype=torch.float32)
         embeddings = self.encode(images)
         vae_pixels = ((images * 2.0) - 1.0).to(dtype=self.dtype)
         with autocast_context(self.device):
-            latent_dist = self.vae.encode(vae_pixels).latent_dist
+            latent_dist = self.vae_encode(vae_pixels).latent_dist
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latents = latent_dist.mean * scaling_factor
-        return embeddings, latents
+        return embeddings, latents.clone()
 
 
 def iter_online_pairs(
@@ -276,7 +377,7 @@ def try_batch_size(
     data_mode: str,
     encoder: OnlineEmbeddingEncoder | None,
     supervisor: OnlineSupervisionEncoder | None,
-    model: nn.Module,
+    model_forward: Callable[[torch.Tensor], torch.Tensor],
     optimizer: AdamW,
     device: torch.device,
 ) -> bool:
@@ -296,7 +397,7 @@ def try_batch_size(
             embeddings, latents = supervisor.encode_supervision(batch["image"][:batch_size])
 
         with autocast_context(device):
-            predictions = model(embeddings)
+            predictions = model_forward(embeddings).clone()
         loss = F.mse_loss(predictions.float(), latents.float())
         loss.backward()
         optimizer.zero_grad(set_to_none=True)
@@ -320,7 +421,7 @@ def auto_select_batch_size(
     max_batch_size: int,
     encoder: OnlineEmbeddingEncoder | None,
     supervisor: OnlineSupervisionEncoder | None,
-    model: nn.Module,
+    model_forward: Callable[[torch.Tensor], torch.Tensor],
     optimizer: AdamW,
     device: torch.device,
     shuffle_buffer: int,
@@ -345,7 +446,7 @@ def auto_select_batch_size(
     bad = upper_bound + 1
     candidate = 1
     while candidate <= upper_bound:
-        if try_batch_size(probe_batch, candidate, data_mode, encoder, supervisor, model, optimizer, device):
+        if try_batch_size(probe_batch, candidate, data_mode, encoder, supervisor, model_forward, optimizer, device):
             good = candidate
             candidate *= 2
             continue
@@ -361,7 +462,7 @@ def auto_select_batch_size(
     high = bad - 1
     while low <= high:
         mid = (low + high) // 2
-        if try_batch_size(probe_batch, mid, data_mode, encoder, supervisor, model, optimizer, device):
+        if try_batch_size(probe_batch, mid, data_mode, encoder, supervisor, model_forward, optimizer, device):
             good = mid
             low = mid + 1
         else:
@@ -371,14 +472,16 @@ def auto_select_batch_size(
 
 def evaluate_cached(
     model: nn.Module,
+    model_forward: Callable[[torch.Tensor], torch.Tensor],
     vae: nn.Module,
+    vae_decode: Callable[..., Any],
     dataloader: DataLoader,
     device: torch.device,
     image_metric_batches: int,
     output_dir: Path,
     epoch: int,
 ) -> dict[str, float]:
-    model.eval()
+    set_module_mode(model, model_forward, training=False)
     latent_mse_sum = 0.0
     image_mse_sum = 0.0
     image_psnr_sum = 0.0
@@ -389,14 +492,14 @@ def evaluate_cached(
         embeddings = batch["embedding"].to(device)
         latents = batch["latents"].to(device)
         with autocast_context(device):
-            predictions = model(embeddings)
+            predictions = model_forward(embeddings).clone()
         latent_mse = F.mse_loss(predictions.float(), latents.float())
         latent_mse_sum += latent_mse.item()
         steps += 1
 
         if batch_index < image_metric_batches:
-            pred_images = decode_latents(vae, predictions)
-            target_images = decode_latents(vae, latents)
+            pred_images = decode_latents(vae, predictions, vae_decode=vae_decode)
+            target_images = decode_latents(vae, latents, vae_decode=vae_decode)
             image_mse = F.mse_loss(pred_images, target_images)
             image_psnr = -10.0 * math.log10(max(image_mse.item(), 1.0e-8))
             image_mse_sum += image_mse.item()
@@ -416,7 +519,9 @@ def evaluate_cached(
 
 def evaluate_latent_online(
     model: nn.Module,
+    model_forward: Callable[[torch.Tensor], torch.Tensor],
     vae: nn.Module,
+    vae_decode: Callable[..., Any],
     encoder: OnlineEmbeddingEncoder,
     latent_dir: str | Path,
     batch_size: int,
@@ -425,7 +530,7 @@ def evaluate_latent_online(
     output_dir: Path,
     epoch: int,
 ) -> dict[str, float]:
-    model.eval()
+    set_module_mode(model, model_forward, training=False)
     latent_mse_sum = 0.0
     image_mse_sum = 0.0
     image_psnr_sum = 0.0
@@ -438,14 +543,14 @@ def evaluate_latent_online(
         latents = batch["latents"].to(device)
         embeddings = encoder.encode(batch["image"])
         with autocast_context(device):
-            predictions = model(embeddings)
+            predictions = model_forward(embeddings).clone()
         latent_mse = F.mse_loss(predictions.float(), latents.float())
         latent_mse_sum += latent_mse.item()
         steps += 1
 
         if batch_index < image_metric_batches:
-            pred_images = decode_latents(vae, predictions)
-            target_images = decode_latents(vae, latents)
+            pred_images = decode_latents(vae, predictions, vae_decode=vae_decode)
+            target_images = decode_latents(vae, latents, vae_decode=vae_decode)
             image_mse = F.mse_loss(pred_images, target_images)
             image_psnr = -10.0 * math.log10(max(image_mse.item(), 1.0e-8))
             image_mse_sum += image_mse.item()
@@ -465,6 +570,7 @@ def evaluate_latent_online(
 
 def evaluate_imagenet_online(
     model: nn.Module,
+    model_forward: Callable[[torch.Tensor], torch.Tensor],
     supervisor: OnlineSupervisionEncoder,
     split: str,
     resolution: int,
@@ -475,7 +581,7 @@ def evaluate_imagenet_online(
     output_dir: Path,
     epoch: int,
 ) -> dict[str, float]:
-    model.eval()
+    set_module_mode(model, model_forward, training=False)
     latent_mse_sum = 0.0
     image_mse_sum = 0.0
     image_psnr_sum = 0.0
@@ -494,14 +600,14 @@ def evaluate_imagenet_online(
     ):
         embeddings, latents = supervisor.encode_supervision(batch["image"])
         with autocast_context(device):
-            predictions = model(embeddings)
+            predictions = model_forward(embeddings).clone()
         latent_mse = F.mse_loss(predictions.float(), latents.float())
         latent_mse_sum += latent_mse.item()
         steps += 1
 
         if batch_index < image_metric_batches:
-            pred_images = decode_latents(supervisor.vae, predictions)
-            target_images = decode_latents(supervisor.vae, latents)
+            pred_images = decode_latents(supervisor.vae, predictions, vae_decode=supervisor.vae_decode)
+            target_images = decode_latents(supervisor.vae, latents, vae_decode=supervisor.vae_decode)
             image_mse = F.mse_loss(pred_images, target_images)
             image_psnr = -10.0 * math.log10(max(image_mse.item(), 1.0e-8))
             image_mse_sum += image_mse.item()
@@ -543,12 +649,16 @@ def train_experiment(
     resolution: int = 256,
     train_samples: int = 0,
     val_samples: int = 0,
+    enable_compile: bool = True,
+    compile_mode: str = "max-autotune",
 ) -> Path:
     set_seed(seed)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tf32_enabled = configure_tf32(device, enabled=True)
+    compile_enabled = enable_compile and supports_torch_compile(device)
     data_mode: str
     train_descriptor: dict[str, Any]
     val_descriptor: dict[str, Any]
@@ -566,6 +676,8 @@ def train_experiment(
                 embedding_kind=embedding_kind,
                 resolution=train_manifest["resolution"],
                 device=device,
+                enable_compile=compile_enabled,
+                compile_mode=compile_mode,
             )
             embedding_shape = encoder.infer_embedding_shape()
             latent_shape = train_manifest["latent_shape"]
@@ -588,6 +700,8 @@ def train_experiment(
             embedding_kind=embedding_kind,
             resolution=resolution,
             device=device,
+            enable_compile=compile_enabled,
+            compile_mode=compile_mode,
         )
         embedding_shape, latent_shape = supervisor.infer_shapes()
         train_descriptor = {
@@ -611,7 +725,15 @@ def train_experiment(
         latent_shape=latent_shape,
         architecture=decoder_architecture,
     ).to(device)
+    model_forward = maybe_compile(
+        model,
+        device=device,
+        enabled=compile_enabled,
+        mode=compile_mode,
+        label="decoder.forward",
+    )
     optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer_step = build_optimizer_step(optimizer, device=device, enabled=compile_enabled, mode=compile_mode)
 
     checkpoint_path = output_path / "last.pt"
     metrics_path = output_path / "metrics.json"
@@ -638,6 +760,8 @@ def train_experiment(
         start_step = checkpoint["step_in_epoch"]
         batch_size = checkpoint.get("run_config", {}).get("batch_size", batch_size)
 
+    optimizer_step = build_optimizer_step(optimizer, device=device, enabled=compile_enabled, mode=compile_mode)
+
     if auto_batch_size and not checkpoint_path.exists():
         batch_size = auto_select_batch_size(
             data_mode=data_mode,
@@ -649,7 +773,7 @@ def train_experiment(
             max_batch_size=max_batch_size,
             encoder=encoder,
             supervisor=supervisor,
-            model=model,
+            model_forward=model_forward,
             optimizer=optimizer,
             device=device,
             shuffle_buffer=online_shuffle_buffer,
@@ -668,6 +792,9 @@ def train_experiment(
         "weight_decay": weight_decay,
         "online_shuffle_buffer": online_shuffle_buffer,
         "checkpoint_interval_steps": checkpoint_interval_steps,
+        "compile_enabled": compile_enabled,
+        "compile_mode": compile_mode,
+        "tf32_enabled": tf32_enabled,
         "train": train_descriptor,
         "val": val_descriptor,
     }
@@ -680,8 +807,10 @@ def train_experiment(
         if supervisor is None:
             raise ValueError("supervisor is required for online ImageNet mode")
         vae = supervisor.vae
+        vae_decode = supervisor.vae_decode
     else:
         vae = load_flux_vae(device=device)
+        vae_decode = vae.decode
 
     if data_mode == "pairs":
         train_dataset = ShardedPairDataset(train_dir)
@@ -720,7 +849,7 @@ def train_experiment(
         )
 
     for epoch in range(start_epoch, epochs + 1):
-        model.train()
+        set_module_mode(model, model_forward, training=True)
         train_loss_sum = 0.0
         train_steps = 0
         epoch_seed = seed + epoch
@@ -760,6 +889,7 @@ def train_experiment(
 
         progress = tqdm(total=steps_per_epoch - start_step, desc=f"train:epoch={epoch}")
         for local_step, batch in enumerate(train_iter, start=start_step + 1):
+            mark_compile_step_begin(compile_enabled)
             if data_mode == "pairs":
                 embeddings = batch["embedding"].to(device)
                 latents = batch["latents"].to(device)
@@ -774,12 +904,12 @@ def train_experiment(
                 embeddings, latents = supervisor.encode_supervision(batch["image"])
 
             with autocast_context(device):
-                predictions = model(embeddings)
+                predictions = model_forward(embeddings).clone()
             loss = F.mse_loss(predictions.float(), latents.float())
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            optimizer.step()
+            optimizer_step()
 
             train_loss_sum += loss.item()
             train_steps += 1
@@ -794,7 +924,9 @@ def train_experiment(
         if data_mode == "pairs":
             val_metrics = evaluate_cached(
                 model=model,
+                model_forward=model_forward,
                 vae=vae,
+                vae_decode=vae_decode,
                 dataloader=val_loader,
                 device=device,
                 image_metric_batches=image_metric_batches,
@@ -806,7 +938,9 @@ def train_experiment(
                 raise ValueError("encoder is required for latent-cached validation")
             val_metrics = evaluate_latent_online(
                 model=model,
+                model_forward=model_forward,
                 vae=vae,
+                vae_decode=vae_decode,
                 encoder=encoder,
                 latent_dir=val_dir,
                 batch_size=eval_batch_size,
@@ -820,6 +954,7 @@ def train_experiment(
                 raise ValueError("supervisor is required for online ImageNet validation")
             val_metrics = evaluate_imagenet_online(
                 model=model,
+                model_forward=model_forward,
                 supervisor=supervisor,
                 split=val_descriptor["split"],
                 resolution=resolution,
@@ -885,6 +1020,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--checkpoint-interval-steps", type=int, default=500)
     parser.add_argument("--online-shuffle-buffer", type=int, default=0)
+    parser.add_argument("--compile-mode", default="max-autotune")
+    parser.add_argument("--compile", dest="enable_compile", action="store_true")
+    parser.add_argument("--no-compile", dest="enable_compile", action="store_false")
+    parser.set_defaults(enable_compile=True)
     return parser
 
 
@@ -919,6 +1058,8 @@ def main() -> None:
         resolution=args.resolution,
         train_samples=args.train_samples,
         val_samples=args.val_samples,
+        enable_compile=args.enable_compile,
+        compile_mode=args.compile_mode,
     )
 
 
