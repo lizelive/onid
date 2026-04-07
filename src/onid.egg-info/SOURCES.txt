@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+src/onid/__init__.py
+src/onid/hf_models.py
+src/onid/models.py
+src/onid/pairs.py
+src/onid/smoke.py
+src/onid/train.py
+src/onid.egg-info/PKG-INFO
+src/onid.egg-info/SOURCES.txt
+src/onid.egg-info/dependency_links.txt
+src/onid.egg-info/top_level.txt

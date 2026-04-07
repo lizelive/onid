@@ -1,0 +1,11 @@
+seed: 0
+resolution: 256
+embedding_kind: pooled
+train_samples: 128
+val_samples: 32
+shard_size: 32
+batch_size: 8
+epochs: 3
+learning_rate: 1.0e-4
+weight_decay: 1.0e-4
+num_workers: 4

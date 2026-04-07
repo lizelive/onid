@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onid"
+version = "0.1.0"
+description = "DINOv3 inversion through FLUX.2 klein VAE latents"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "GitHub Copilot" }]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

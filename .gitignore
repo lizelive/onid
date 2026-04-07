@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+*.pyc
+outputs/
+artifacts/
+.cache/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+.DS_Store
