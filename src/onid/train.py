@@ -138,6 +138,12 @@ def resolve_sample_count(split: str, max_samples: int) -> int:
     return min(max_samples, total)
 
 
+def steps_for_samples(sample_count: int, batch_size: int) -> int:
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    return math.ceil(sample_count / batch_size)
+
+
 @torch.inference_mode()
 def decode_latents(
     vae: nn.Module,
@@ -487,6 +493,7 @@ def evaluate_cached(
     image_psnr_sum = 0.0
     steps = 0
     image_steps = 0
+    progress = tqdm(total=len(dataloader), desc=f"val:epoch={epoch}")
 
     for batch_index, batch in enumerate(dataloader):
         embeddings = batch["embedding"].to(device)
@@ -509,6 +516,11 @@ def evaluate_cached(
             if batch_index == 0:
                 sample_grid = make_grid(torch.cat([target_images[:4], pred_images[:4]], dim=0), nrow=4)
                 save_image(sample_grid, output_dir / f"epoch-{epoch:03d}-recon.png")
+
+        progress.update(1)
+        progress.set_postfix(latent_mse=f"{latent_mse_sum / max(steps, 1):.4f}")
+
+    progress.close()
 
     return {
         "latent_mse": latent_mse_sum / max(steps, 1),
@@ -536,6 +548,8 @@ def evaluate_latent_online(
     image_psnr_sum = 0.0
     steps = 0
     image_steps = 0
+    manifest = load_manifest(latent_dir)
+    progress = tqdm(total=steps_for_samples(manifest["num_samples"], batch_size), desc=f"val:epoch={epoch}")
 
     for batch_index, batch in enumerate(
         iter_online_batches(latent_dir=latent_dir, batch_size=batch_size, seed=0, shuffle_buffer=0)
@@ -560,6 +574,11 @@ def evaluate_latent_online(
             if batch_index == 0:
                 sample_grid = make_grid(torch.cat([target_images[:4], pred_images[:4]], dim=0), nrow=4)
                 save_image(sample_grid, output_dir / f"epoch-{epoch:03d}-recon.png")
+
+        progress.update(1)
+        progress.set_postfix(latent_mse=f"{latent_mse_sum / max(steps, 1):.4f}")
+
+    progress.close()
 
     return {
         "latent_mse": latent_mse_sum / max(steps, 1),
@@ -587,6 +606,7 @@ def evaluate_imagenet_online(
     image_psnr_sum = 0.0
     steps = 0
     image_steps = 0
+    progress = tqdm(total=steps_for_samples(sample_count, batch_size), desc=f"val:epoch={epoch}")
 
     for batch_index, batch in enumerate(
         iter_imagenet_batches(
@@ -617,6 +637,11 @@ def evaluate_imagenet_online(
             if batch_index == 0:
                 sample_grid = make_grid(torch.cat([target_images[:4], pred_images[:4]], dim=0), nrow=4)
                 save_image(sample_grid, output_dir / f"epoch-{epoch:03d}-recon.png")
+
+        progress.update(1)
+        progress.set_postfix(latent_mse=f"{latent_mse_sum / max(steps, 1):.4f}")
+
+    progress.close()
 
     return {
         "latent_mse": latent_mse_sum / max(steps, 1),
@@ -780,7 +805,14 @@ def train_experiment(
             seed=seed,
         )
 
-    eval_batch_size = eval_batch_size or min(batch_size, 8)
+    if eval_batch_size is None:
+        eval_batch_size = batch_size if data_mode == "imagenet" else min(batch_size, 8)
+
+    print(
+        "run configuration: "
+        f"data_mode={data_mode} train_batch_size={batch_size} eval_batch_size={eval_batch_size} "
+        f"compile={compile_enabled} tf32={tf32_enabled}"
+    )
     run_config = {
         "data_mode": data_mode,
         "embedding_kind": embedding_kind,
@@ -920,6 +952,11 @@ def train_experiment(
                 save_checkpoint(epoch, local_step)
 
         progress.close()
+
+        print(
+            f"validation:epoch={epoch} samples={val_samples} batch_size={eval_batch_size} "
+            f"steps={steps_for_samples(val_samples, eval_batch_size)}"
+        )
 
         if data_mode == "pairs":
             val_metrics = evaluate_cached(

@@ -94,7 +94,6 @@ python -m onid.train \
   --epochs 3 \
   --auto-batch-size \
   --max-batch-size 256 \
-  --eval-batch-size 8 \
   --compile \
   --compile-mode max-autotune \
   --checkpoint-interval-steps 500 \
@@ -130,4 +129,5 @@ At `256x256` resolution:
 ## Recovery
 
 - `onid.train --resume` writes `last.pt` and `state.json` during training, so interrupted long runs continue from the latest checkpointed step without rebuilding any dataset cache.
+- Online ImageNet validation now defaults to the fitted train batch size and prints its own progress bar, so long validation passes stay visible in `pipeline.log`.
 

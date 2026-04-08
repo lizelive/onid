@@ -114,6 +114,10 @@ The decoder reduces training latent loss over three epochs, but validation image
 
 Qualitative reconstructions show that the pooled DINOv3 embedding retains coarse color statistics and broad spatial layout, but not enough localized information for recognizable object recovery in this decoder regime. The outputs tend toward muted, texture-like fields with weak central blobs rather than object-faithful reconstructions. In practice, the fixed FLUX VAE decoder renders valid-looking image textures from predicted latents, but the learned mapping from pooled DINO features does not recover enough geometry to make the images semantically sharp.
 
+![Smoke-scale pooled reconstructions. Top row: validation targets. Bottom row: decoded reconstructions from predicted FLUX latents.](figures/smoke-pooled-epoch-003-recon.png)
+
+*Figure 1. Smoke-scale pooled inversion after three epochs. The model captures coarse color and horizon structure, but object identity and fine geometry are mostly lost.*
+
 The implication is straightforward: pooled DINOv3 embeddings appear to preserve some scene-level information, but a stronger inversion result will likely require one or more of the following changes:
 
 1. dense patch-token inputs instead of pooled embeddings
@@ -124,6 +128,14 @@ The implication is straightforward: pooled DINOv3 embeddings appear to preserve 
 ## 6. Discussion
 
 The design cleanly separates semantic retention from image synthesis. If reconstructions are recognizable from pooled embeddings, DINOv3 retains substantial scene-level information in its global representation. If dense embeddings materially outperform pooled embeddings, that would confirm that most recoverable spatial detail lives in patch tokens rather than the pooled summary.
+
+![Longer pooled-training reconstructions. Top row: validation targets. Bottom row: pooled-model reconstructions after extended training.](figures/full-pooled-epoch-050-recon.png)
+
+*Figure 2. Pooled inversion after a longer 16k-train and 2k-validation run. The decoder preserves broad color fields and some global layout, but outputs remain blurred and only weakly semantic even with much more data and training time.*
+
+![Dense-token reconstructions from the full online ImageNet run. Top row: validation targets. Bottom row: dense residual decoder reconstructions.](figures/full-dense-residual-epoch-003-recon.png)
+
+*Figure 3. Dense-token inversion on the full online ImageNet setup. Relative to pooled inversion, the reconstructions recover clearer object silhouettes and scene structure, consistent with the much lower image MSE and higher PSNR of the dense decoder.*
 
 The experiment also highlights a systems tradeoff: very strong frozen encoders can be straightforward to invert on a subset, yet full-dataset inversion becomes dominated by feature caching and IO constraints rather than decoder complexity.
 

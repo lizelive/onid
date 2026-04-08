@@ -20,7 +20,6 @@ for architecture in dense-residual dense-pyramid dense-bottleneck; do
     --batch-size 8 \
     --auto-batch-size \
     --max-batch-size 256 \
-    --eval-batch-size 8 \
     --compile \
     --compile-mode max-autotune \
     --checkpoint-interval-steps 500 \
